@@ -1,0 +1,664 @@
+package com.example.brothercollab
+
+import android.app.Activity
+import android.content.ActivityNotFoundException
+import android.content.Context
+import android.content.Intent
+import android.net.Uri
+import android.os.Build
+import android.os.Bundle
+import android.view.ViewGroup
+import android.webkit.CookieManager
+import android.webkit.WebChromeClient
+import android.webkit.WebSettings
+import android.webkit.WebView
+import android.webkit.WebViewClient
+import android.widget.Toast
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
+import androidx.annotation.SuppressLint
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.safeDrawing
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.outlined.Chat
+import androidx.compose.material.icons.outlined.Group
+import androidx.compose.material.icons.outlined.Language
+import androidx.compose.material.icons.outlined.Settings
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Button
+import androidx.compose.material3.CenterAlignedTopAppBar
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.NavigationBar
+import androidx.compose.material3.NavigationBarItem
+import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
+import androidx.compose.material3.TextField
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.MutableState
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableLongStateOf
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.ComposeView
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.viewinterop.AndroidView
+import androidx.core.splashscreen.SplashScreen
+import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
+import kotlinx.coroutines.delay
+import org.json.JSONObject
+
+class MainActivity : ComponentActivity() {
+
+    @OptIn(ExperimentalMaterial3Api::class)
+    override fun onCreate(savedInstanceState: Bundle?) {
+        val splash: SplashScreen = installSplashScreen()
+        super.onCreate(savedInstanceState)
+
+        CookieManager.getInstance().setAcceptCookie(true)
+
+        setContentView(R.layout.activity_main)
+
+        val composeView: ComposeView = findViewById(R.id.compose_view)
+        composeView.setContent {
+            MaterialTheme {
+                AppRoot()
+            }
+        }
+    }
+}
+
+private enum class Tab { DeepSeek, ChatGPT, Group }
+
+// ---------- Subscription & Usage ----------
+private const val DAILY_FREE_LIMIT_MILLIS = 20L * 60L * 1000L // 20 minutes/day
+
+private class Prefs(ctx: Context) {
+    private val sp = ctx.getSharedPreferences("subs", Context.MODE_PRIVATE)
+
+    fun isPremium(): Boolean = sp.getBoolean("premium", false)
+    fun setPremium(v: Boolean) = sp.edit().putBoolean("premium", v).apply()
+
+    fun getUsageDay(): String = sp.getString("usage_day", "") ?: ""
+    fun setUsageDay(day: String) = sp.edit().putString("usage_day", day).apply()
+
+    fun getUsageMillis(): Long = sp.getLong("usage_ms", 0L)
+    fun setUsageMillis(ms: Long) = sp.edit().putLong("usage_ms", ms).apply()
+
+    fun resetUsageForToday() {
+        setUsageMillis(0L)
+        setUsageDay(todayKey())
+    }
+}
+
+private fun todayKey(): String {
+    val cal = java.util.Calendar.getInstance()
+    val y = cal.get(java.util.Calendar.YEAR)
+    val m = cal.get(java.util.Calendar.MONTH) + 1
+    val d = cal.get(java.util.Calendar.DAY_OF_MONTH)
+    return "%04d%02d%02d".format(y, m, d)
+}
+
+private fun formatMillis(ms: Long): String {
+    val totalSec = (ms / 1000).toInt()
+    val min = totalSec / 60
+    val sec = totalSec % 60
+    return "${min}m ${sec}s"
+}
+
+// ---------- UI ----------
+@Composable
+private fun AppRoot() {
+    val context = LocalContext.current
+    val prefs = remember { Prefs(context) }
+
+    val deepSeekWebView = remember { WebView(context) }
+    val chatGptWebView = remember { WebView(context) }
+
+    var selectedTab by rememberSaveable { mutableStateOf(Tab.DeepSeek) }
+    var showSettings by remember { mutableStateOf(false) }
+
+    var showComposeSplash by rememberSaveable { mutableStateOf(true) }
+    LaunchedEffect(Unit) {
+        delay(900)
+        showComposeSplash = false
+    }
+
+    var isPremium by rememberSaveable { mutableStateOf(prefs.isPremium()) }
+    LaunchedEffect(Unit) {
+        if (prefs.getUsageDay() != todayKey()) {
+            prefs.resetUsageForToday()
+        }
+    }
+    var usedMs by remember { mutableLongStateOf(prefs.getUsageMillis()) }
+    val remainingMs: Long = if (isPremium) Long.MAX_VALUE else (DAILY_FREE_LIMIT_MILLIS - usedMs).coerceAtLeast(0L)
+    val showPaywall = !isPremium && remainingMs <= 0L
+
+    // Tick usage each second while not premium and not at paywall
+    LaunchedEffect(isPremium, showPaywall) {
+        while (true) {
+            delay(1000)
+            if (!isPremium && !showPaywall) {
+                if (prefs.getUsageDay() != todayKey()) {
+                    prefs.resetUsageForToday()
+                    usedMs = 0L
+                }
+                usedMs += 1000
+                prefs.setUsageMillis(usedMs)
+                prefs.setUsageDay(todayKey())
+            }
+        }
+    }
+
+    BackHandler(enabled = true) {
+        val currentWV = when (selectedTab) {
+            Tab.DeepSeek -> deepSeekWebView
+            Tab.ChatGPT -> chatGptWebView
+            Tab.Group -> if (deepSeekWebView.canGoBack()) deepSeekWebView else chatGptWebView
+        }
+        if (currentWV.canGoBack()) currentWV.goBack()
+    }
+
+    val titles = mapOf(
+        Tab.DeepSeek to "DeepSeek",
+        Tab.ChatGPT to "ChatGPT",
+        Tab.Group to "Group Mode"
+    )
+
+    Scaffold(
+        topBar = {
+            CenterAlignedTopAppBar(
+                title = {
+                    if (isPremium) {
+                        Text("${titles[selectedTab] ?: "Brother Collab"} • Ultimate")
+                    } else {
+                        Text("${titles[selectedTab] ?: "Brother Collab"} • Free left: ${formatMillis(remainingMs)}")
+                    }
+                },
+                actions = {
+                    IconButton(onClick = { showSettings = true }) {
+                        Icon(Icons.Outlined.Settings, contentDescription = "Settings")
+                    }
+                }
+            )
+        },
+        bottomBar = {
+            BottomNavBar(selectedTab = selectedTab, onSelect = { selectedTab = it })
+        },
+        contentWindowInsets = WindowInsets.safeDrawing
+    ) { inner ->
+        Box(
+            modifier = Modifier
+                .padding(inner)
+                .fillMaxSize()
+        ) {
+            when (selectedTab) {
+                Tab.DeepSeek -> {
+                    WebViewScreen(
+                        webView = deepSeekWebView,
+                        url = "https://chat.deepseek.com",
+                        enableThirdPartyCookies = false,
+                        titleSink = null,
+                        enableZoom = true
+                    )
+                }
+                Tab.ChatGPT -> {
+                    WebViewScreen(
+                        webView = chatGptWebView,
+                        url = "https://chatgpt.com",
+                        enableThirdPartyCookies = true,
+                        titleSink = null,
+                        enableZoom = true,
+                        overrideUserAgent = "Mozilla/5.0 (Linux; Android 13; Pixel 6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36",
+                        allowMultiWindow = true
+                    )
+                }
+                Tab.Group -> {
+                    GroupModeScreen(
+                        deepSeekWebView = deepSeekWebView,
+                        chatGptWebView = chatGptWebView
+                    )
+                }
+            }
+
+            if (showComposeSplash) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .background(Color.White),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text(
+                        text = "Brother Collab",
+                        style = MaterialTheme.typography.headlineLarge
+                    )
+                }
+            }
+
+            if (showPaywall) {
+                Paywall(
+                    onSubscribe = {
+                        openUpiPayment(
+                            context = context,
+                            upiId = "your@upi", // TODO: apna UPI ID daaliye
+                            name = "Brother Collab",
+                            note = "Ultimate Subscription",
+                            amountInr = "199"
+                        )
+                    },
+                    onIHavePaid = {
+                        prefs.setPremium(true)
+                        isPremium = true
+                        Toast.makeText(context, "Ultimate unlocked!", Toast.LENGTH_SHORT).show()
+                    },
+                    onCloseApp = {
+                        (context as? Activity)?.finish()
+                    }
+                )
+            }
+        }
+    }
+
+    if (showSettings) {
+        SettingsDialog(
+            isPremium = isPremium,
+            remainingLabel = if (isPremium) "Unlimited" else formatMillis(remainingMs),
+            onDismiss = { showSettings = false },
+            onDonate = {
+                openUpiPayment(
+                    context = context,
+                    upiId = "your@upi",
+                    name = "Brother Collab",
+                    note = "Support",
+                    amountInr = ""
+                )
+            },
+            onGoPremium = {
+                openUpiPayment(
+                    context = context,
+                    upiId = "your@upi",
+                    name = "Brother Collab",
+                    note = "Ultimate Subscription",
+                    amountInr = "199"
+                )
+            },
+            onIHavePaid = {
+                prefs.setPremium(true)
+                isPremium = true
+                Toast.makeText(context, "Ultimate unlocked!", Toast.LENGTH_SHORT).show()
+            },
+            onClearCookies = {
+                try {
+                    CookieManager.getInstance().removeAllCookies(null)
+                    CookieManager.getInstance().flush()
+                    Toast.makeText(context, "Cookies cleared. You may need to log in again.", Toast.LENGTH_SHORT).show()
+                } catch (e: Exception) {
+                    Toast.makeText(context, "Failed to clear cookies: ${e.message}", Toast.LENGTH_SHORT).show()
+                }
+            },
+            onResetFreeTimer = {
+                prefs.resetUsageForToday()
+                usedMs = 0L
+            }
+        )
+    }
+}
+
+@Composable
+private fun BottomNavBar(selectedTab: Tab, onSelect: (Tab) -> Unit) {
+    NavigationBar(modifier = Modifier.navigationBarsPadding()) {
+        NavigationBarItem(
+            selected = selectedTab == Tab.DeepSeek,
+            onClick = { onSelect(Tab.DeepSeek) },
+            icon = { Icon(Icons.Outlined.Language, contentDescription = "DeepSeek") },
+            label = { Text("DeepSeek") }
+        )
+        NavigationBarItem(
+            selected = selectedTab == Tab.ChatGPT,
+            onClick = { onSelect(Tab.ChatGPT) },
+            icon = { Icon(Icons.Outlined.Chat, contentDescription = "ChatGPT") },
+            label = { Text("ChatGPT") }
+        )
+        NavigationBarItem(
+            selected = selectedTab == Tab.Group,
+            onClick = { onSelect(Tab.Group) },
+            icon = { Icon(Icons.Outlined.Group, contentDescription = "Group") },
+            label = { Text("Group") }
+        )
+    }
+}
+
+@SuppressLint("SetJavaScriptEnabled")
+@Composable
+private fun WebViewScreen(
+    webView: WebView,
+    url: String,
+    enableThirdPartyCookies: Boolean,
+    titleSink: MutableState<String?>? = null,
+    enableZoom: Boolean = true,
+    overrideUserAgent: String? = null,
+    allowMultiWindow: Boolean = false
+) {
+    AndroidWebView(
+        webView = webView,
+        url = url,
+        configure = {
+            settings.javaScriptEnabled = true
+            settings.domStorageEnabled = true
+            settings.databaseEnabled = true
+            settings.cacheMode = WebSettings.LOAD_DEFAULT
+            settings.useWideViewPort = true
+            settings.loadWithOverviewMode = true
+
+            if (overrideUserAgent != null) {
+                settings.userAgentString = overrideUserAgent
+            }
+
+            if (enableZoom) {
+                settings.setSupportZoom(true)
+                settings.builtInZoomControls = true
+                settings.displayZoomControls = false
+            } else {
+                settings.setSupportZoom(false)
+                settings.builtInZoomControls = false
+            }
+
+            CookieManager.getInstance().setAcceptCookie(true)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP && enableThirdPartyCookies) {
+                CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
+            }
+
+            if (allowMultiWindow) {
+                settings.javaScriptCanOpenWindowsAutomatically = true
+                settings.setSupportMultipleWindows(true)
+            }
+
+            webViewClient = object : WebViewClient() {
+                override fun onPageFinished(view: WebView?, url: String?) {
+                    super.onPageFinished(view, url)
+                    titleSink?.value = view?.title
+                }
+            }
+            webChromeClient = object : WebChromeClient() {
+                override fun onCreateWindow(
+                    view: WebView?,
+                    isDialog: Boolean,
+                    isUserGesture: Boolean,
+                    resultMsg: android.os.Message?
+                ): Boolean {
+                    val openUrl = view?.hitTestResult?.extra
+                    if (!openUrl.isNullOrEmpty()) {
+                        view.context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(openUrl)))
+                    }
+                    return false
+                }
+            }
+        }
+    )
+}
+
+@SuppressLint("SetJavaScriptEnabled")
+@Composable
+private fun GroupModeScreen(
+    deepSeekWebView: WebView,
+    chatGptWebView: WebView
+) {
+    val input = remember { mutableStateOf("") }
+
+    Column(modifier = Modifier.fillMaxSize()) {
+        AndroidWebView(
+            modifier = Modifier
+                .weight(1f)
+                .fillMaxWidth(),
+            webView = deepSeekWebView,
+            url = "https://chat.deepseek.com",
+            configure = {
+                settings.javaScriptEnabled = true
+                settings.domStorageEnabled = true
+                settings.databaseEnabled = true
+                settings.setSupportZoom(true)
+                settings.builtInZoomControls = true
+                settings.displayZoomControls = false
+                settings.useWideViewPort = true
+                settings.loadWithOverviewMode = true
+
+                CookieManager.getInstance().setAcceptCookie(true)
+                webViewClient = WebViewClient()
+                webChromeClient = WebChromeClient()
+            }
+        )
+
+        AndroidWebView(
+            modifier = Modifier
+                .weight(1f)
+                .fillMaxWidth(),
+            webView = chatGptWebView,
+            url = "https://chatgpt.com",
+            configure = {
+                settings.javaScriptEnabled = true
+                settings.domStorageEnabled = true
+                settings.databaseEnabled = true
+                settings.setSupportZoom(true)
+                settings.builtInZoomControls = true
+                settings.displayZoomControls = false
+                settings.useWideViewPort = true
+                settings.loadWithOverviewMode = true
+                settings.userAgentString =
+                    "Mozilla/5.0 (Linux; Android 13; Pixel 6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
+
+                CookieManager.getInstance().setAcceptCookie(true)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+                    CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
+                }
+
+                webViewClient = WebViewClient()
+                webChromeClient = WebChromeClient()
+            }
+        )
+
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            TextField(
+                modifier = Modifier.weight(1f),
+                value = input.value,
+                onValueChange = { input.value = it },
+                placeholder = { Text("Type a message for both...") },
+                singleLine = true,
+                keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
+                keyboardActions = KeyboardActions(
+                    onSend = {
+                        sendToBoth(deepSeekWebView, chatGptWebView, input.value)
+                        input.value = ""
+                    }
+                )
+            )
+            TextButton(
+                onClick = {
+                    sendToBoth(deepSeekWebView, chatGptWebView, input.value)
+                    input.value = ""
+                }
+            ) {
+                Text("Send")
+            }
+        }
+    }
+}
+
+private fun sendToBoth(deepSeekWebView: WebView, chatGptWebView: WebView, message: String) {
+    if (message.isBlank()) return
+    val jsSafeMsg = JSONObject.quote(message)
+    val injector = """
+        (function() {
+          try {
+            var text = $jsSafeMsg;
+            var ta = document.querySelector('textarea');
+            if (ta) {
+              ta.focus();
+              ta.value = text;
+              ta.dispatchEvent(new Event('input', { bubbles: true }));
+              var form = ta.closest('form');
+              var btn = form ? form.querySelector('button[type="submit"]') : null;
+              if (btn) btn.click();
+            }
+            var ce = document.querySelector('[contenteditable="true"]');
+            if (ce) {
+              ce.focus();
+              ce.textContent = text;
+              ce.dispatchEvent(new Event('input', { bubbles: true }));
+              var evt = new KeyboardEvent('keydown', { key:'Enter', code:'Enter', bubbles:true });
+              ce.dispatchEvent(evt);
+            }
+            return 'ok';
+          } catch (e) {
+            return 'error:' + e.toString();
+          }
+        })();
+    """.trimIndent()
+
+    deepSeekWebView.evaluateJavascript(injector, null)
+    chatGptWebView.evaluateJavascript(injector, null)
+}
+
+@Composable
+private fun SettingsDialog(
+    isPremium: Boolean,
+    remainingLabel: String,
+    onDismiss: () -> Unit,
+    onDonate: () -> Unit,
+    onGoPremium: () -> Unit,
+    onIHavePaid: () -> Unit,
+    onClearCookies: () -> Unit,
+    onResetFreeTimer: () -> Unit
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Settings") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text(if (isPremium) "Plan: Ultimate (₹199)" else "Plan: Free")
+                if (!isPremium) Text("Free time left today: $remainingLabel")
+                TextButton(onClick = onGoPremium) { Text("Go Premium (₹199)") }
+                if (!isPremium) TextButton(onClick = onIHavePaid) { Text("I have paid – Unlock") }
+                TextButton(onClick = onDonate) { Text("Donate via UPI") }
+                TextButton(onClick = onClearCookies) { Text("Clear cookies") }
+                TextButton(onClick = onResetFreeTimer) { Text("Reset free timer (dev)") }
+            }
+        },
+        confirmButton = { TextButton(onClick = onDismiss) { Text("Close") } }
+    )
+}
+
+@Composable
+private fun Paywall(
+    onSubscribe: () -> Unit,
+    onIHavePaid: () -> Unit,
+    onCloseApp: () -> Unit
+) {
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Color(0xCC000000)),
+        contentAlignment = Alignment.Center
+    ) {
+        Surface(
+            shape = RoundedCornerShape(16.dp),
+            color = Color.White,
+            tonalElevation = 6.dp,
+            modifier = Modifier
+                .padding(24.dp)
+                .fillMaxWidth()
+        ) {
+            Column(
+                modifier = Modifier.padding(20.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp),
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+                Text("Limit reached", style = MaterialTheme.typography.headlineSmall)
+                Text("Free plan allows 20 minutes per day.\nUnlock Ultimate for unlimited access.", modifier = Modifier.padding(top = 4.dp))
+                Button(onClick = onSubscribe, modifier = Modifier.fillMaxWidth()) {
+                    Text("Go Ultimate – ₹199")
+                }
+                TextButton(onClick = onIHavePaid) {
+                    Text("I’ve paid – Unlock")
+                }
+                TextButton(onClick = onCloseApp) {
+                    Text("Close app")
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun AndroidWebView(
+    webView: WebView,
+    url: String,
+    modifier: Modifier = Modifier,
+    configure: WebView.() -> Unit
+) {
+    AndroidView(
+        modifier = modifier,
+        factory = {
+            ensureDetachedFromParent(webView)
+            if (webView.url == null) {
+                webView.configure()
+                webView.loadUrl(url)
+            } else {
+                webView.configure()
+            }
+            webView
+        },
+        update = { }
+    )
+}
+
+private fun ensureDetachedFromParent(webView: WebView) {
+    val parent = webView.parent
+    if (parent is ViewGroup) parent.removeView(webView)
+}
+
+private fun openUpiPayment(
+    context: Context,
+    upiId: String,
+    name: String,
+    note: String,
+    amountInr: String
+) {
+    val base = "upi://pay?pa=${Uri.encode(upiId)}&pn=${Uri.encode(name)}&tn=${Uri.encode(note)}&cu=INR"
+    val uri = if (amountInr.isNotBlank()) Uri.parse("$base&am=${Uri.encode(amountInr)}") else Uri.parse(base)
+    val intent = Intent(Intent.ACTION_VIEW, uri).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+    try {
+        context.startActivity(intent)
+    } catch (_: ActivityNotFoundException) {
+        Toast.makeText(context, "No UPI app found.", Toast.LENGTH_SHORT).show()
+    }
+}
